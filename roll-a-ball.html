@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Roll-a-Ball</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020; font-family: system-ui, sans-serif; touch-action: none; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 14px; left: 16px; color: #fff; font-size: 20px; text-shadow: 0 2px 6px rgba(0,0,0,.6); pointer-events: none; }
+  #hud small { display: block; font-size: 13px; opacity: .75; margin-top: 4px; }
+  #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column;
+         color: #fff; background: rgba(0,0,0,.55); text-align: center; }
+  #msg h1 { font-size: 48px; margin: 0 0 8px; }
+  #msg button { margin-top: 18px; padding: 12px 28px; font-size: 18px; border: 0; border-radius: 10px; background: #ffd23f; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>Score: <span id="score">0</span> / <span id="total">0</span> &nbsp;|&nbsp; Time: <span id="time">0.0</span>s</div>
+  <small>WASD / Arrow keys to roll (or drag on touch) &bull; R to restart</small>
+</div>
+<div id="msg">
+  <h1>You win! 🎉</h1>
+  <div id="final"></div>
+  <button id="again">Play again</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  // ---------- Scene ----------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b1020);
+  scene.fog = new THREE.Fog(0x0b1020, 30, 80);
+
+  const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 200);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x223344, 0.7));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+  sun.position.set(10, 25, 10);
+  sun.castShadow = true;
+  sun.shadow.camera.left = -40; sun.shadow.camera.right = 40;
+  sun.shadow.camera.top = 40; sun.shadow.camera.bottom = -40;
+  sun.shadow.mapSize.set(2048, 2048);
+  scene.add(sun);
+
+  // ---------- Level data ----------
+  const R = 0.5;                      // ball radius
+  const WALL_H = 1.5;
+  const platforms = [                 // top surface at y = 0
+    { x: 0, z: 0,   w: 20, d: 20 },   // main arena
+    { x: 0, z: -15, w: 3,  d: 10 },   // bridge
+    { x: 0, z: -27, w: 14, d: 14 }    // far platform
+  ];
+  const walls = [
+    { x: -4, z: 2,   w: 6, d: 1 },
+    { x: 5,  z: -3,  w: 1, d: 8 },
+    { x: -6, z: -6,  w: 1, d: 5 },
+    { x: 3,  z: 6,   w: 5, d: 1 },
+    { x: -3, z: -27, w: 1, d: 7 },
+    { x: 3,  z: -25, w: 1, d: 7 }
+  ];
+  const pickupSpots = [
+    [-7, 7], [7, 7], [0, 4], [8, 0], [-8, -2], [-3, -8], [8, -8],
+    [0, -15], [-5, -24], [5, -24], [0, -30], [-5, -31]
+  ];
+  const spawn = new THREE.Vector3(0, R, 8);
+
+  // ---------- Build geometry ----------
+  const platMat = new THREE.MeshStandardMaterial({ color: 0x3a4a6b, roughness: 0.9 });
+  platforms.forEach(p => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(p.w, 1, p.d), platMat);
+    m.position.set(p.x, -0.5, p.z);
+    m.receiveShadow = true;
+    scene.add(m);
+    const grid = new THREE.GridHelper(Math.max(p.w, p.d), Math.max(p.w, p.d), 0x6f86b8, 0x4c5f88);
+    grid.scale.set(p.w / Math.max(p.w, p.d), 1, p.d / Math.max(p.w, p.d));
+    grid.position.set(p.x, 0.01, p.z);
+    scene.add(grid);
+  });
+
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xc0504d, roughness: 0.6 });
+  walls.forEach(w => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w.w, WALL_H, w.d), wallMat);
+    m.position.set(w.x, WALL_H / 2, w.z);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+  });
+
+  // Ball with a checker texture so the rolling is visible
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+    g.fillStyle = (x + y) % 2 ? '#ffd23f' : '#ff7a1a';
+    g.fillRect(x * 16, y * 16, 16, 16);
+  }
+  const ball = new THREE.Mesh(
+    new THREE.SphereGeometry(R, 32, 24),
+    new THREE.MeshStandardMaterial({ map: new THREE.CanvasTexture(c), roughness: 0.4 })
+  );
+  ball.castShadow = true;
+  scene.add(ball);
+
+  const pickups = [];
+  const pickMat = new THREE.MeshStandardMaterial({ color: 0x38f5c8, emissive: 0x16b894, emissiveIntensity: 0.9 });
+  pickupSpots.forEach(([x, z]) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), pickMat);
+    m.position.set(x, 0.8, z);
+    m.castShadow = true;
+    scene.add(m);
+    pickups.push(m);
+  });
+
+  // ---------- State ----------
+  const pos = new THREE.Vector3().copy(spawn);
+  const vel = new THREE.Vector3();
+  let score = 0, time = 0, won = false;
+  const scoreEl = document.getElementById('score');
+  const timeEl = document.getElementById('time');
+  document.getElementById('total').textContent = pickups.length;
+
+  function reset(full) {
+    pos.copy(spawn); vel.set(0, 0, 0);
+    if (full) {
+      score = 0; time = 0; won = false;
+      pickups.forEach(p => p.visible = true);
+      scoreEl.textContent = 0;
+      document.getElementById('msg').style.display = 'none';
+    }
+  }
+
+  // ---------- Input ----------
+  const keys = {};
+  addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (e.code === 'KeyR') reset(true);
+    if (e.code.startsWith('Arrow')) e.preventDefault();
+  });
+  addEventListener('keyup', e => keys[e.code] = false);
+
+  let touchStart = null, touchVec = { x: 0, z: 0 };
+  addEventListener('pointerdown', e => { if (e.pointerType === 'touch') touchStart = { x: e.clientX, y: e.clientY }; });
+  addEventListener('pointermove', e => {
+    if (!touchStart) return;
+    touchVec.x = Math.max(-1, Math.min(1, (e.clientX - touchStart.x) / 60));
+    touchVec.z = Math.max(-1, Math.min(1, (e.clientY - touchStart.y) / 60));
+  });
+  addEventListener('pointerup', () => { touchStart = null; touchVec = { x: 0, z: 0 }; });
+
+  document.getElementById('again').onclick = () => reset(true);
+
+  // ---------- Physics helpers ----------
+  function onPlatform(x, z) {
+    return platforms.some(p => Math.abs(x - p.x) <= p.w / 2 && Math.abs(z - p.z) <= p.d / 2);
+  }
+
+  function collideWalls() {
+    if (pos.y > WALL_H + R) return;
+    for (const w of walls) {
+      const hx = w.w / 2, hz = w.d / 2;
+      const cx = Math.max(w.x - hx, Math.min(pos.x, w.x + hx));
+      const cz = Math.max(w.z - hz, Math.min(pos.z, w.z + hz));
+      let dx = pos.x - cx, dz = pos.z - cz;
+      const dist = Math.hypot(dx, dz);
+      if (dist < R) {
+        if (dist === 0) { dx = 1; dz = 0; }
+        else { dx /= dist; dz /= dist; }
+        const push = R - dist;
+        pos.x += dx * push; pos.z += dz * push;
+        const vn = vel.x * dx + vel.z * dz;
+        if (vn < 0) { vel.x -= 1.3 * vn * dx; vel.z -= 1.3 * vn * dz; }
+      }
+    }
+  }
+
+  // ---------- Loop ----------
+  const clock = new THREE.Clock();
+  const ACCEL = 28, GRAVITY = 25, MAX_SPEED = 14;
+  const camOffset = new THREE.Vector3(0, 9, 10);
+  camera.position.copy(pos).add(camOffset);
+
+  function step(dt) {
+    let ix = 0, iz = 0;
+    if (keys.KeyA || keys.ArrowLeft)  ix -= 1;
+    if (keys.KeyD || keys.ArrowRight) ix += 1;
+    if (keys.KeyW || keys.ArrowUp)    iz -= 1;
+    if (keys.KeyS || keys.ArrowDown)  iz += 1;
+    ix += touchVec.x; iz += touchVec.z;
+    const len = Math.hypot(ix, iz);
+    if (len > 1) { ix /= len; iz /= len; }
+
+    const grounded = pos.y <= R + 0.001 && onPlatform(pos.x, pos.z);
+    if (grounded) {
+      vel.x += ix * ACCEL * dt;
+      vel.z += iz * ACCEL * dt;
+      const damp = Math.max(0, 1 - 0.6 * dt);
+      vel.x *= damp; vel.z *= damp;
+    } else {
+      vel.x += ix * ACCEL * 0.25 * dt;   // slight air control
+      vel.z += iz * ACCEL * 0.25 * dt;
+    }
+
+    const sp = Math.hypot(vel.x, vel.z);
+    if (sp > MAX_SPEED) { vel.x *= MAX_SPEED / sp; vel.z *= MAX_SPEED / sp; }
+
+    vel.y -= GRAVITY * dt;
+    pos.addScaledVector(vel, dt);
+
+    if (onPlatform(pos.x, pos.z) && pos.y < R && pos.y > -0.6) {
+      pos.y = R;
+      if (vel.y < 0) vel.y = 0;
+    }
+
+    collideWalls();
+
+    // roll the ball visually
+    const dist = Math.hypot(vel.x, vel.z) * dt;
+    if (dist > 1e-5 && grounded) {
+      const axis = new THREE.Vector3(vel.z, 0, -vel.x).normalize();
+      ball.rotateOnWorldAxis(axis, dist / R);
+    }
+
+    if (pos.y < -12) reset(false);   // fell off
+
+    // pickups
+    pickups.forEach(p => {
+      if (!p.visible) return;
+      if (p.position.distanceTo(pos) < R + 0.45) {
+        p.visible = false;
+        score++;
+        scoreEl.textContent = score;
+      }
+    });
+
+    if (!won && score === pickups.length) {
+      won = true;
+      document.getElementById('final').textContent = 'Finished in ' + time.toFixed(1) + ' seconds';
+      document.getElementById('msg').style.display = 'flex';
+    }
+  }
+
+  function frame() {
+    requestAnimationFrame(frame);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    if (!won) { time += dt; timeEl.textContent = time.toFixed(1); }
+
+    // fixed sub-steps for stable collisions
+    const n = 3;
+    for (let i = 0; i < n; i++) step(dt / n);
+
+    ball.position.copy(pos);
+    const t = performance.now() / 1000;
+    pickups.forEach(p => {
+      p.rotation.x += dt * 0.26 * 4; p.rotation.y += dt * 0.52 * 4; p.rotation.z += dt * 0.78 * 4;
+      p.position.y = 0.8 + Math.sin(t * 2 + p.position.x) * 0.12;
+    });
+
+    const target = pos.clone().add(camOffset);
+    camera.position.lerp(target, 1 - Math.pow(0.001, dt));
+    camera.lookAt(pos.x, pos.y * 0.5, pos.z);
+
+    renderer.render(scene, camera);
+  }
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  frame();
+})();
+</script>
+</body>
+</html>
